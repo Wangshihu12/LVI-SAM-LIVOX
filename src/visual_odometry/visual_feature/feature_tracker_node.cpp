@@ -31,33 +31,41 @@ bool           init_pub         = 0;
 
 void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
 {
+    // 获取当前图像的时间戳
     double cur_img_time = img_msg->header.stamp.toSec();
 
+    // 处理第一帧图像的特殊情况
     if (first_image_flag)
     {
         first_image_flag = false;
-        first_image_time = cur_img_time;
-        last_image_time  = cur_img_time;
-        return;
+        first_image_time = cur_img_time;  // 记录第一帧图像时间
+        last_image_time  = cur_img_time;  // 记录上一帧图像时间
+        return; // 第一帧直接返回，不进行处理
     }
-    // detect unstable camera stream
+    
+    // 检测相机数据流是否稳定
+    // 如果两帧间隔超过1秒或时间戳倒退，说明数据流不稳定
     if (cur_img_time - last_image_time > 1.0 || cur_img_time < last_image_time)
     {
         ROS_WARN("image discontinue! reset the feature tracker!");
+        // 重置特征跟踪器状态
         first_image_flag = true;
         last_image_time  = 0;
         pub_count        = 1;
+        // 发布重启信号给VINS估计器
         std_msgs::Bool restart_flag;
         restart_flag.data = true;
         pub_restart.publish(restart_flag);
         return;
     }
-    last_image_time = cur_img_time;
-    // frequency control
+    last_image_time = cur_img_time; // 更新上一帧时间戳
+
+    // 频率控制：根据设定的FREQ参数控制发布频率
+    // 计算当前平均帧率是否小于等于设定频率
     if (round(1.0 * pub_count / (cur_img_time - first_image_time)) <= FREQ)
     {
-        PUB_THIS_FRAME = true;
-        // reset the frequency control
+        PUB_THIS_FRAME = true; // 标记当前帧需要发布
+        // 如果当前帧率接近设定频率，重置频率控制计数器
         if (abs(1.0 * pub_count / (cur_img_time - first_image_time) - FREQ) < 0.01 * FREQ)
         {
             first_image_time = cur_img_time;
@@ -66,10 +74,12 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
     }
     else
     {
-        PUB_THIS_FRAME = false;
+        PUB_THIS_FRAME = false; // 跳过当前帧
     }
 
+    // 图像格式转换处理
     cv_bridge::CvImageConstPtr ptr;
+    // 如果输入图像编码是"8UC1"，需要转换为"mono8"格式
     if (img_msg->encoding == "8UC1")
     {
         sensor_msgs::Image img;
@@ -79,35 +89,45 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         img.is_bigendian = img_msg->is_bigendian;
         img.step         = img_msg->step;
         img.data         = img_msg->data;
-        img.encoding     = "mono8";
+        img.encoding     = "mono8"; // 修改编码格式
         ptr              = cv_bridge::toCvCopy(img, sensor_msgs::image_encodings::MONO8);
     }
     else
+        // 直接转换为MONO8格式
         ptr = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::MONO8);
 
-    cv::Mat show_img = ptr->image;
-    TicToc  t_r;
+    cv::Mat show_img = ptr->image; // 用于显示的图像
+    TicToc  t_r; // 计时器
+
+    // 对每个相机进行特征提取和跟踪
     for (int i = 0; i < NUM_OF_CAM; i++)
     {
         ROS_DEBUG("processing camera %d", i);
+        // 如果不是第二个相机或者不是双目跟踪模式
         if (i != 1 || !STEREO_TRACK)
+            // 读取图像的特定行范围（支持多相机垂直拼接）
             trackerData[i].readImage(ptr->image.rowRange(ROW * i, ROW * (i + 1)), cur_img_time);
         else
         {
+            // 双目跟踪模式下的第二个相机处理
             if (EQUALIZE)
             {
+                // 使用CLAHE算法进行直方图均衡化增强图像对比度
                 cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE();
                 clahe->apply(ptr->image.rowRange(ROW * i, ROW * (i + 1)), trackerData[i].cur_img);
             }
             else
+                // 直接使用原图像
                 trackerData[i].cur_img = ptr->image.rowRange(ROW * i, ROW * (i + 1));
         }
 
 #if SHOW_UNDISTORTION
+        // 显示去畸变效果（调试用）
         trackerData[i].showUndistortion("undistrotion_" + std::to_string(i));
 #endif
     }
 
+    // 更新特征点ID，确保跨帧特征点的一致性
     for (unsigned int i = 0;; i++)
     {
         bool completed = false;
@@ -115,106 +135,125 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
             if (j != 1 || !STEREO_TRACK)
                 completed |= trackerData[j].updateID(i);
         if (!completed)
-            break;
+            break; // 所有特征点ID更新完成
     }
 
+    // 如果当前帧需要发布特征点
     if (PUB_THIS_FRAME)
     {
-        pub_count++;
+        pub_count++; // 发布计数器递增
+        
+        // 创建特征点云消息
         sensor_msgs::PointCloudPtr  feature_points(new sensor_msgs::PointCloud);
-        sensor_msgs::ChannelFloat32 id_of_point;
-        sensor_msgs::ChannelFloat32 u_of_point;
-        sensor_msgs::ChannelFloat32 v_of_point;
-        sensor_msgs::ChannelFloat32 velocity_x_of_point;
-        sensor_msgs::ChannelFloat32 velocity_y_of_point;
+        sensor_msgs::ChannelFloat32 id_of_point;          // 特征点ID通道
+        sensor_msgs::ChannelFloat32 u_of_point;           // 像素u坐标通道
+        sensor_msgs::ChannelFloat32 v_of_point;           // 像素v坐标通道
+        sensor_msgs::ChannelFloat32 velocity_x_of_point;  // x方向光流速度通道
+        sensor_msgs::ChannelFloat32 velocity_y_of_point;  // y方向光流速度通道
 
+        // 设置消息头信息
         feature_points->header.stamp    = img_msg->header.stamp;
         feature_points->header.frame_id = "vins_body";
 
+        // 用于记录每个相机的特征点ID，避免重复
         vector<set<int>> hash_ids(NUM_OF_CAM);
+        
+        // 遍历每个相机的特征点
         for (int i = 0; i < NUM_OF_CAM; i++)
         {
-            auto &un_pts       = trackerData[i].cur_un_pts;
-            auto &cur_pts      = trackerData[i].cur_pts;
-            auto &ids          = trackerData[i].ids;
-            auto &pts_velocity = trackerData[i].pts_velocity;
+            auto &un_pts       = trackerData[i].cur_un_pts;   // 去畸变后的归一化坐标
+            auto &cur_pts      = trackerData[i].cur_pts;      // 当前帧像素坐标
+            auto &ids          = trackerData[i].ids;          // 特征点ID
+            auto &pts_velocity = trackerData[i].pts_velocity; // 特征点光流速度
+            
             for (unsigned int j = 0; j < ids.size(); j++)
             {
+                // 只处理跟踪次数大于1的稳定特征点
                 if (trackerData[i].track_cnt[j] > 1)
                 {
                     int p_id = ids[j];
                     hash_ids[i].insert(p_id);
+                    
+                    // 创建3D点，z坐标设为1（归一化坐标）
                     geometry_msgs::Point32 p;
                     p.x = un_pts[j].x;
                     p.y = un_pts[j].y;
                     p.z = 1;
 
+                    // 添加特征点信息到各个通道
                     feature_points->points.push_back(p);
-                    id_of_point.values.push_back(p_id * NUM_OF_CAM + i);
-                    u_of_point.values.push_back(cur_pts[j].x);
-                    v_of_point.values.push_back(cur_pts[j].y);
-                    velocity_x_of_point.values.push_back(pts_velocity[j].x);
-                    velocity_y_of_point.values.push_back(pts_velocity[j].y);
+                    id_of_point.values.push_back(p_id * NUM_OF_CAM + i);  // 全局唯一ID
+                    u_of_point.values.push_back(cur_pts[j].x);            // 像素u坐标
+                    v_of_point.values.push_back(cur_pts[j].y);            // 像素v坐标
+                    velocity_x_of_point.values.push_back(pts_velocity[j].x); // x方向速度
+                    velocity_y_of_point.values.push_back(pts_velocity[j].y); // y方向速度
                 }
             }
         }
 
+        // 将所有通道添加到特征点云消息中
         feature_points->channels.push_back(id_of_point);
         feature_points->channels.push_back(u_of_point);
         feature_points->channels.push_back(v_of_point);
         feature_points->channels.push_back(velocity_x_of_point);
         feature_points->channels.push_back(velocity_y_of_point);
 
-        // get feature depth from lidar point cloud
+        // 从激光雷达点云中获取特征点的深度信息
         // 从全局的点云地图中提取特征点的深度信息
         pcl::PointCloud<PointType>::Ptr depth_cloud_temp(new pcl::PointCloud<PointType>());
-        mtx_lidar.lock();
+        mtx_lidar.lock();   // 加锁保护共享的点云数据
         *depth_cloud_temp = *depthCloud;
-        mtx_lidar.unlock();
+        mtx_lidar.unlock(); // 解锁
 
+        // 使用深度注册器获取特征点深度
         sensor_msgs::ChannelFloat32 depth_of_points =
             depthRegister->get_depth(img_msg->header.stamp, show_img, depth_cloud_temp,
                                      trackerData[0].m_camera, feature_points->points);
         feature_points->channels.push_back(depth_of_points);
 
-        // skip the first image; since no optical speed on frist image
+        // 跳过第一帧图像的发布，因为第一帧没有光流速度信息
         if (!init_pub)
         {
             init_pub = 1;
         }
         else
-            pub_feature.publish(feature_points);
+            pub_feature.publish(feature_points); // 发布特征点给VINS估计器
 
-        // publish features in image
+        // 发布带有特征点标记的图像用于可视化
         if (pub_match.getNumSubscribers() != 0)
         {
+            // 将图像转换为RGB格式用于可视化
             ptr = cv_bridge::cvtColor(ptr, sensor_msgs::image_encodings::RGB8);
-            //cv::Mat stereo_img(ROW * NUM_OF_CAM, COL, CV_8UC3);
             cv::Mat stereo_img = ptr->image;
 
+            // 为每个相机的图像区域绘制特征点
             for (int i = 0; i < NUM_OF_CAM; i++)
             {
+                // 获取当前相机对应的图像区域
                 cv::Mat tmp_img = stereo_img.rowRange(i * ROW, (i + 1) * ROW);
                 cv::cvtColor(show_img, tmp_img, CV_GRAY2RGB);
 
+                // 在图像上绘制每个特征点
                 for (unsigned int j = 0; j < trackerData[i].cur_pts.size(); j++)
                 {
                     if (SHOW_TRACK)
                     {
-                        // track count
+                        // 根据跟踪次数显示特征点颜色（跟踪越久颜色越绿）
                         double len = std::min(1.0, 1.0 * trackerData[i].track_cnt[j] / WINDOW_SIZE);
                         cv::circle(tmp_img, trackerData[i].cur_pts[j], 4,
                                    cv::Scalar(255 * (1 - len), 255 * len, 0), 4);
                     }
                     else
                     {
-                        // depth
+                        // 根据深度信息显示特征点颜色
                         if (j < depth_of_points.values.size())
                         {
                             if (depth_of_points.values[j] > 0)
+                                // 有深度信息：绿色圆圈
                                 cv::circle(tmp_img, trackerData[i].cur_pts[j], 4,
                                            cv::Scalar(0, 255, 0), 4);
                             else
+                                // 无深度信息：红色圆圈
                                 cv::circle(tmp_img, trackerData[i].cur_pts[j], 4,
                                            cv::Scalar(0, 0, 255), 4);
                         }
@@ -222,6 +261,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
                 }
             }
 
+            // 发布可视化图像
             pub_match.publish(ptr->toImageMsg());
         }
     }
