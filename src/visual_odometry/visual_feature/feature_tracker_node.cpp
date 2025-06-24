@@ -269,80 +269,118 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
 
 void lidar_callback(const sensor_msgs::PointCloud2ConstPtr &laser_msg)
 {
+    // 静态变量，用于记录激光雷达帧计数，初始值为-1
     static int lidar_count = -1;
-    // LIDAR_SKIP = 3
+    
+    // 激光雷达跳帧处理：LIDAR_SKIP = 3，表示每4帧处理1帧
+    // 这样做是为了降低计算负担，因为激光雷达频率通常比相机高
     if (++lidar_count % (LIDAR_SKIP + 1) != 0)
         return;
 
-    // 0. listen to transform
+    // ========== 第0步：监听坐标变换 ==========
+    // 静态变量，避免重复创建TF监听器和变换对象
     static tf::TransformListener listener;
     static tf::StampedTransform  transform;
+    
     try
     {
-        // waitForTransform( [父类坐标系], [子类坐标系], [在这一时刻], [时间段] )
-        // 时间段为 waitForTransform() 函数 的结束条件：最多等待 4 秒，如果提前得到了坐标的转换信息，直接结束等待。
-        // 捕获 T_W_I
+        // waitForTransform参数说明：
+        // - "vins_world": 父坐标系（世界坐标系）
+        // - "vins_body_ros": 子坐标系（机器人本体坐标系）
+        // - laser_msg->header.stamp: 变换的时间戳（激光雷达数据的时间戳）
+        // - ros::Duration(0.01): 最大等待时间0.01秒
+        // 目的：获取从机器人本体到世界坐标系的变换矩阵 T_W_I
         listener.waitForTransform("vins_world", "vins_body_ros", laser_msg->header.stamp,
                                   ros::Duration(0.01));
         listener.lookupTransform("vins_world", "vins_body_ros", laser_msg->header.stamp, transform);
     }
     catch (tf::TransformException ex)
     {
+        // 如果获取变换失败，直接返回（不处理当前帧）
+        // 注释掉错误输出是为了避免频繁打印错误信息
         // ROS_ERROR("lidar no tf");
         return;
     }
 
+    // 从TF变换中提取位置和姿态信息
     double xCur, yCur, zCur, rollCur, pitchCur, yawCur;
+    
+    // 提取平移部分（位置信息）
     xCur = transform.getOrigin().x();
     yCur = transform.getOrigin().y();
     zCur = transform.getOrigin().z();
+    
+    // 提取旋转部分并转换为欧拉角（姿态信息）
     tf::Matrix3x3 m(transform.getRotation());
     m.getRPY(rollCur, pitchCur, yawCur);
+    
+    // 构建当前时刻的变换矩阵，用于后续点云坐标变换
     Eigen::Affine3f transNow = pcl::getTransformation(xCur, yCur, zCur, rollCur, pitchCur, yawCur);
 
-    // 1. convert laser cloud message to pcl
+    // ========== 第1步：ROS消息转换为PCL点云 ==========
     pcl::PointCloud<PointType>::Ptr laser_cloud_in(new pcl::PointCloud<PointType>());
+    // 将ROS的PointCloud2消息转换为PCL点云格式，便于后续处理
     pcl::fromROSMsg(*laser_msg, *laser_cloud_in);
 
-    // 2. downsample new cloud (save memory)
+    // ========== 第2步：点云降采样（节省内存） ==========
     pcl::PointCloud<PointType>::Ptr  laser_cloud_in_ds(new pcl::PointCloud<PointType>());
+    // 静态变量，避免重复创建体素滤波器对象
     static pcl::VoxelGrid<PointType> downSizeFilter;
+    
+    // 设置体素大小为0.2x0.2x0.2米，将密集点云降采样
+    // 降采样可以减少数据量，提高处理速度，同时保持点云的主要特征
     downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
     downSizeFilter.setInputCloud(laser_cloud_in);
     downSizeFilter.filter(*laser_cloud_in_ds);
     *laser_cloud_in = *laser_cloud_in_ds;
 
-    // 3. filter lidar points (only keep points in camera view)
+    // ========== 第3步：滤波筛选点云（只保留相机视野内的点） ==========
     pcl::PointCloud<PointType>::Ptr laser_cloud_in_filter(new pcl::PointCloud<PointType>());
+    
     for (int i = 0; i < (int)laser_cloud_in->size(); ++i)
     {
         PointType p = laser_cloud_in->points[i];
-        // 假定相机跟lidar方向一致的，lidar是x朝前，得到的点云数据是lidar坐标系下的
-        // 所以下面是先筛选出朝向一致的点云
+        
+        // 筛选条件说明：
+        // 1. p.x >= 0: 只保留前方的点（假设激光雷达x轴朝前）
+        // 2. abs(p.y / p.x) <= 10: 限制左右视野角度（约84度视野角）
+        // 3. abs(p.z / p.x) <= 10: 限制上下视野角度（约84度视野角）
+        // 这样可以只保留大致在相机视野范围内的激光点，减少无效数据
         if (p.x >= 0 && abs(p.y / p.x) <= 10 && abs(p.z / p.x) <= 10)
             laser_cloud_in_filter->push_back(p);
     }
     *laser_cloud_in = *laser_cloud_in_filter;
 
-    // 4. offset T_lidar -> T_imu
+    // ========== 第4步：激光雷达坐标系转IMU坐标系 ==========
     pcl::PointCloud<PointType>::Ptr laser_cloud_offset(new pcl::PointCloud<PointType>());
-    Eigen::Affine3f                 transOffset =
-        pcl::getTransformation(L_I_TX, L_I_TY, L_I_TZ, L_I_RX, L_I_RY, L_I_RZ);
+    
+    // 使用外参将点云从激光雷达坐标系转换到IMU坐标系
+    // L_I_TX, L_I_TY, L_I_TZ: 激光雷达相对于IMU的平移
+    // L_I_RX, L_I_RY, L_I_RZ: 激光雷达相对于IMU的旋转
+    Eigen::Affine3f transOffset = pcl::getTransformation(L_I_TX, L_I_TY, L_I_TZ, L_I_RX, L_I_RY, L_I_RZ);
     pcl::transformPointCloud(*laser_cloud_in, *laser_cloud_offset, transOffset);
     *laser_cloud_in = *laser_cloud_offset;
 
-    // 5. transform new cloud into global odom frame
+    // ========== 第5步：将点云变换到全局里程计坐标系 ==========
     pcl::PointCloud<PointType>::Ptr laser_cloud_global(new pcl::PointCloud<PointType>());
+    
+    // 使用当前位姿将点云从IMU坐标系变换到世界坐标系
+    // 这样所有历史点云都统一在同一个全局坐标系下
     pcl::transformPointCloud(*laser_cloud_in, *laser_cloud_global, transNow);
 
-    // 6. save new cloud
+    // ========== 第6步：保存新的点云到队列 ==========
     double timeScanCur = laser_msg->header.stamp.toSec();
+    
+    // 将变换后的全局点云和对应时间戳加入队列
+    // 这些队列用于维护一个滑动窗口的点云历史
     cloudQueue.push_back(*laser_cloud_global);
     timeQueue.push_back(timeScanCur);
 
-    // 7. pop old cloud
+    // ========== 第7步：移除过旧的点云 ==========
     while (!timeQueue.empty())
     {
+        // 如果最老的点云超过5秒，就将其移除
+        // 这样可以控制内存使用，避免点云数据无限增长
         if (timeScanCur - timeQueue.front() > 5.0)
         {
             cloudQueue.pop_front();
@@ -350,18 +388,26 @@ void lidar_callback(const sensor_msgs::PointCloud2ConstPtr &laser_msg)
         }
         else
         {
-            break;
+            break; // 一旦遇到未过期的点云就停止删除
         }
     }
 
+    // 加锁保护全局共享的点云数据，确保线程安全
     std::lock_guard<std::mutex> lock(mtx_lidar);
-    // 8. fuse global cloud
-    depthCloud->clear();
+    
+    // ========== 第8步：融合全局点云 ==========
+    depthCloud->clear(); // 清空之前的全局点云
+    
+    // 将队列中的所有点云合并成一个大的全局点云
+    // 这个全局点云包含了过去5秒内的所有激光雷达数据
     for (int i = 0; i < (int)cloudQueue.size(); ++i)
         *depthCloud += cloudQueue[i];
 
-    // 9. downsample global cloud
+    // ========== 第9步：对全局点云进行最终降采样 ==========
     pcl::PointCloud<PointType>::Ptr depthCloudDS(new pcl::PointCloud<PointType>());
+    
+    // 对融合后的大点云再次降采样，进一步控制数据量
+    // 这样既保证了点云的覆盖范围，又控制了计算复杂度
     downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
     downSizeFilter.setInputCloud(depthCloud);
     downSizeFilter.filter(*depthCloudDS);
