@@ -33,49 +33,129 @@ FeatureTracker::FeatureTracker()
 {
 }
 
+/**
+ * [功能描述]：设置特征点检测掩码，确保特征点分布均匀且优先保留长期跟踪的稳定特征点
+ * 
+ * 掩码作用：
+ * - 白色区域(255)：允许检测新特征点的区域
+ * - 黑色区域(0)：禁止检测新特征点的区域
+ * 
+ * 策略：优先保留跟踪次数多的特征点，在其周围设置禁区避免新特征点过于密集
+ */
 void FeatureTracker::setMask()
 {
+    // ========== 第1步：初始化掩码图像 ==========
     if(FISHEYE)
+        // 如果使用鱼眼相机，使用预加载的鱼眼掩码
+        // 鱼眼掩码通常会屏蔽图像边缘的畸变严重区域
         mask = fisheye_mask.clone();
     else
+        // 普通相机：创建全白掩码(255表示所有区域都可以检测特征点)
+        // ROW: 图像高度, COL: 图像宽度, CV_8UC1: 8位单通道, cv::Scalar(255): 全白
         mask = cv::Mat(ROW, COL, CV_8UC1, cv::Scalar(255));
     
-
-    // prefer to keep features that are tracked for long time
+    // ========== 第2步：构建特征点优先级排序数据结构 ==========
+    // 创建包含 <跟踪次数, <特征点坐标, 特征点ID>> 的向量
+    // 用于按跟踪次数对特征点进行排序，优先保留长期跟踪的稳定特征点
     vector<pair<int, pair<cv::Point2f, int>>> cnt_pts_id;
 
+    // 遍历所有当前跟踪的特征点，构建排序数据
     for (unsigned int i = 0; i < forw_pts.size(); i++)
         cnt_pts_id.push_back(make_pair(track_cnt[i], make_pair(forw_pts[i], ids[i])));
+        // make_pair结构：
+        // - track_cnt[i]: 第i个特征点的跟踪次数（优先级指标）
+        // - forw_pts[i]: 第i个特征点在下一帧中的坐标
+        // - ids[i]: 第i个特征点的唯一标识符
 
+    // ========== 第3步：按跟踪次数降序排序 ==========
+    // 使用lambda表达式自定义排序规则：跟踪次数多的特征点排在前面
+    // 这样可以优先保留更稳定、跟踪时间更长的特征点
     sort(cnt_pts_id.begin(), cnt_pts_id.end(), [](const pair<int, pair<cv::Point2f, int>> &a, const pair<int, pair<cv::Point2f, int>> &b)
          {
-            return a.first > b.first;
+            return a.first > b.first; // a.first > b.first 表示按跟踪次数降序排列
          });
 
-    forw_pts.clear();
-    ids.clear();
-    track_cnt.clear();
+    // ========== 第4步：清空原有特征点数据 ==========
+    // 准备重新填充经过掩码筛选后的特征点数据
+    forw_pts.clear();   // 清空特征点坐标容器
+    ids.clear();        // 清空特征点ID容器  
+    track_cnt.clear();  // 清空跟踪次数容器
 
+    // ========== 第5步：根据掩码筛选并重建特征点列表 ==========
+    // 按优先级顺序遍历排序后的特征点
     for (auto &it : cnt_pts_id)
     {
+        // 检查当前特征点位置的掩码值
+        // mask.at<uchar>() 获取指定坐标处的掩码值
+        // it.second.first 是特征点坐标 cv::Point2f
         if (mask.at<uchar>(it.second.first) == 255)
         {
-            forw_pts.push_back(it.second.first);
-            ids.push_back(it.second.second);
-            track_cnt.push_back(it.first);
+            // 掩码值为255（白色）表示该位置允许保留特征点
+            
+            // 将该特征点添加到筛选后的特征点列表中
+            forw_pts.push_back(it.second.first);    // 添加特征点坐标
+            ids.push_back(it.second.second);        // 添加特征点ID  
+            track_cnt.push_back(it.first);          // 添加跟踪次数
+            
+            // 在掩码上以该特征点为圆心，MIN_DIST为半径画黑色实心圆
+            // 参数说明：
+            // - mask: 目标掩码图像
+            // - it.second.first: 圆心坐标（特征点位置）
+            // - MIN_DIST: 圆的半径（最小特征点间距）
+            // - 0: 圆的颜色（黑色，表示禁区）
+            // - -1: 线宽（-1表示填充实心圆）
             cv::circle(mask, it.second.first, MIN_DIST, 0, -1);
+            
+            // 作用：在该特征点周围MIN_DIST范围内设置禁区
+            // 确保后续检测的新特征点不会在此范围内，保持特征点分布的均匀性
         }
+        // 如果掩码值为0（黑色），说明该位置在禁区内，丢弃该特征点
     }
 }
 
+/**
+ * [功能描述]：将新检测到的特征点添加到跟踪系统中
+ * 
+ * 调用时机：在goodFeaturesToTrack检测到新特征点后调用
+ * 作用：初始化新特征点的相关数据结构，纳入特征点跟踪管理系统
+ * 
+ * 数据结构说明：
+ * - forw_pts: 存储特征点在下一帧中的像素坐标
+ * - ids: 存储特征点的全局唯一标识符
+ * - track_cnt: 存储每个特征点的跟踪次数（用于评估特征点质量）
+ */
 void FeatureTracker::addPoints()
 {
+    // ========== 遍历所有新检测到的特征点 ==========
+    // n_pts: 通过cv::goodFeaturesToTrack检测到的新特征点容器
+    // 这些是在当前帧中新发现的Shi-Tomasi角点
     for (auto &p : n_pts)
     {
+        // ===== 第1步：添加特征点坐标 =====
+        // 将新特征点的像素坐标添加到下一帧特征点容器中
+        // p是cv::Point2f类型，包含(x,y)像素坐标
         forw_pts.push_back(p);
+        
+        // ===== 第2步：分配临时ID =====
+        // 为新特征点分配临时ID(-1)
+        // -1表示该特征点还未获得全局唯一ID
+        // 真正的全局唯一ID将在后续的updateID()函数中分配
+        // 这样设计是为了避免ID冲突，确保每个特征点都有唯一标识
         ids.push_back(-1);
+        
+        // ===== 第3步：初始化跟踪计数 =====
+        // 将新特征点的跟踪次数初始化为1
+        // 跟踪次数的意义：
+        // - 1: 新检测到的特征点，刚开始跟踪
+        // - >1: 已经跟踪多帧的稳定特征点
+        // 跟踪次数越高，表示特征点越稳定，质量越好
         track_cnt.push_back(1);
     }
+    
+    // 函数执行后的状态：
+    // - forw_pts, ids, track_cnt三个容器的大小保持一致
+    // - 新特征点已经纳入跟踪系统，等待下一帧的光流跟踪
+    // - 临时ID(-1)将在updateID()中被替换为全局唯一ID
 }
 
 void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
@@ -235,39 +315,82 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
     prev_time = cur_time; // 更新时间戳
 }
 
+/**
+ * [功能描述]：使用基础矩阵和RANSAC算法剔除光流跟踪中的外点
+ * 
+ * 原理：基于对极几何约束，利用基础矩阵检测不符合相机运动模型的特征点匹配
+ * 目的：提高特征点匹配的精度，去除跟踪错误和噪声点
+ * 
+ * 前提条件：至少需要8个特征点对才能计算基础矩阵
+ */
 void FeatureTracker::rejectWithF()
 {
+    // ========== 第1步：检查特征点数量 ==========
+    // 基础矩阵计算需要最少8个对应点对（8点算法）
     if (forw_pts.size() >= 8)
     {
         ROS_DEBUG("FM ransac begins");
-        TicToc t_f;
+        TicToc t_f; // 基础矩阵计算计时器
+        
+        // ========== 第2步：坐标去畸变处理 ==========
+        // 创建去畸变后的特征点坐标容器
         vector<cv::Point2f> un_cur_pts(cur_pts.size()), un_forw_pts(forw_pts.size());
+        
+        // 对当前帧和下一帧的所有特征点进行去畸变处理
         for (unsigned int i = 0; i < cur_pts.size(); i++)
         {
-            Eigen::Vector3d tmp_p;
+            Eigen::Vector3d tmp_p; // 临时3D坐标变量
+            
+            // ===== 处理当前帧特征点 =====
+            // 将像素坐标转换为归一化相机坐标（去畸变）
+            // liftProjective: 像素坐标 -> 归一化相机坐标（考虑畸变）
             m_camera->liftProjective(Eigen::Vector2d(cur_pts[i].x, cur_pts[i].y), tmp_p);
+            
+            // 将归一化坐标重新投影到虚拟的理想相机平面
+            // 使用统一的焦距FOCAL_LENGTH，消除不同相机内参的影响
+            // 公式：u = fx * X/Z + cx, v = fy * Y/Z + cy
             tmp_p.x() = FOCAL_LENGTH * tmp_p.x() / tmp_p.z() + COL / 2.0;
             tmp_p.y() = FOCAL_LENGTH * tmp_p.y() / tmp_p.z() + ROW / 2.0;
             un_cur_pts[i] = cv::Point2f(tmp_p.x(), tmp_p.y());
 
+            // ===== 处理下一帧特征点 =====
+            // 同样的去畸变和重投影过程
             m_camera->liftProjective(Eigen::Vector2d(forw_pts[i].x, forw_pts[i].y), tmp_p);
             tmp_p.x() = FOCAL_LENGTH * tmp_p.x() / tmp_p.z() + COL / 2.0;
             tmp_p.y() = FOCAL_LENGTH * tmp_p.y() / tmp_p.z() + ROW / 2.0;
             un_forw_pts[i] = cv::Point2f(tmp_p.x(), tmp_p.y());
         }
 
-        vector<uchar> status;
+        // ========== 第3步：使用RANSAC计算基础矩阵 ==========
+        vector<uchar> status; // 内点/外点标记：1表示内点，0表示外点
+        
+        // 使用OpenCV的RANSAC算法计算基础矩阵
+        // 参数说明：
+        // - un_cur_pts, un_forw_pts: 去畸变后的特征点对
+        // - cv::FM_RANSAC: 使用RANSAC算法
+        // - F_THRESHOLD: 点到对极线的距离阈值（通常为1.0像素）
+        // - 0.99: RANSAC的置信度（99%的概率找到正确模型）
+        // - status: 输出每个点的内点/外点标记
         cv::findFundamentalMat(un_cur_pts, un_forw_pts, cv::FM_RANSAC, F_THRESHOLD, 0.99, status);
-        int size_a = cur_pts.size();
-        reduceVector(prev_pts, status);
-        reduceVector(cur_pts, status);
-        reduceVector(forw_pts, status);
-        reduceVector(cur_un_pts, status);
-        reduceVector(ids, status);
-        reduceVector(track_cnt, status);
+        
+        // ========== 第4步：根据基础矩阵结果剔除外点 ==========
+        int size_a = cur_pts.size(); // 记录筛选前的特征点数量
+        
+        // 根据status标记，只保留内点，移除外点
+        // 对所有与特征点相关的数据结构进行同步更新
+        reduceVector(prev_pts, status);   // 前一帧特征点坐标
+        reduceVector(cur_pts, status);    // 当前帧特征点坐标
+        reduceVector(forw_pts, status);   // 下一帧特征点坐标
+        reduceVector(cur_un_pts, status); // 当前帧去畸变归一化坐标
+        reduceVector(ids, status);        // 特征点唯一ID
+        reduceVector(track_cnt, status);  // 特征点跟踪次数
+        
+        // ========== 第5步：输出筛选结果统计 ==========
         ROS_DEBUG("FM ransac: %d -> %lu: %f", size_a, forw_pts.size(), 1.0 * forw_pts.size() / size_a);
+        // 输出格式：原始数量 -> 筛选后数量: 保留比例
         ROS_DEBUG("FM ransac costs: %fms", t_f.toc());
     }
+    // 如果特征点数量不足8个，跳过基础矩阵筛选
 }
 
 bool FeatureTracker::updateID(unsigned int i)

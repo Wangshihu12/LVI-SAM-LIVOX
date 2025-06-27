@@ -203,115 +203,180 @@ void restart_callback(const std_msgs::BoolConstPtr &restart_msg)
     return;
 }
 
-// thread: visual-inertial odometry
+/**
+ * [功能描述]：VINS估计器的主处理循环，融合IMU和视觉特征数据进行状态估计
+ * 
+ * 主要流程：
+ * 1. 获取同步的IMU和图像特征数据
+ * 2. 执行IMU预积分
+ * 3. 处理视觉特征点并进行VINS优化
+ * 4. 发布估计结果和可视化信息
+ */
 void process()
 {
+    // ========== 主处理循环 ==========
     while (ros::ok())
     {
+        // ##### 第1步：获取同步测量数据 #####
+        // 数据结构：每个measurement包含一组IMU数据和一帧图像特征数据
         std::vector<
             std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>>
                                      measurements;
+        
+        // 加锁并等待新的测量数据到达
         std::unique_lock<std::mutex> lk(m_buf);
+        // 条件变量等待：直到getMeasurements()返回非空数据
+        // getMeasurements()负责从缓冲区中提取时间同步的IMU和图像特征数据
         con.wait(lk, [&] { return (measurements = getMeasurements()).size() != 0; });
         lk.unlock();
 
+        // 加锁保护估计器状态，确保线程安全
         m_estimator.lock();
+        
+        // ========== 遍历处理每个测量数据包 ==========
         for (auto &measurement : measurements)
         {
-            auto img_msg = measurement.second;
+            auto img_msg = measurement.second; // 图像特征点消息
 
-            // 1. IMU pre-integration
+            // ########################################
+            // ##### 第2步：IMU预积分处理 #####
+            // ########################################
+            
+            // IMU数据变量：线性加速度和角速度
             double dx = 0, dy = 0, dz = 0, rx = 0, ry = 0, rz = 0;
+            
+            // 遍历当前图像帧对应的所有IMU数据
             for (auto &imu_msg : measurement.first)
             {
-                double t     = imu_msg->header.stamp.toSec();
-                double img_t = img_msg->header.stamp.toSec() + estimator.td;
+                double t     = imu_msg->header.stamp.toSec();           // IMU时间戳
+                double img_t = img_msg->header.stamp.toSec() + estimator.td; // 图像时间戳+时间偏移
+
+                // ===== 情况1：IMU时间戳小于等于图像时间戳 =====
                 if (t <= img_t)
                 {
+                    // 初始化当前时间
                     if (current_time < 0)
                         current_time = t;
+                    
+                    // 计算时间间隔
                     double dt = t - current_time;
-                    ROS_ASSERT(dt >= 0);
-                    current_time = t;
-                    dx           = imu_msg->linear_acceleration.x;
-                    dy           = imu_msg->linear_acceleration.y;
-                    dz           = imu_msg->linear_acceleration.z;
-                    rx           = imu_msg->angular_velocity.x;
-                    ry           = imu_msg->angular_velocity.y;
-                    rz           = imu_msg->angular_velocity.z;
+                    ROS_ASSERT(dt >= 0); // 确保时间间隔非负
+                    current_time = t;    // 更新当前时间
+                    
+                    // 提取IMU测量值
+                    dx = imu_msg->linear_acceleration.x;  // x轴线性加速度
+                    dy = imu_msg->linear_acceleration.y;  // y轴线性加速度
+                    dz = imu_msg->linear_acceleration.z;  // z轴线性加速度
+                    rx = imu_msg->angular_velocity.x;     // x轴角速度
+                    ry = imu_msg->angular_velocity.y;     // y轴角速度
+                    rz = imu_msg->angular_velocity.z;     // z轴角速度
+                    
+                    // 执行IMU预积分处理
                     estimator.processIMU(dt, Vector3d(dx, dy, dz), Vector3d(rx, ry, rz));
-                    //printf("imu: dt:%f a: %f %f %f w: %f %f %f\n",dt, dx, dy, dz, rx, ry, rz);
                 }
                 else
                 {
-                    double dt_1  = img_t - current_time;
-                    double dt_2  = t - img_t;
-                    current_time = img_t;
+                    // ===== 情况2：IMU时间戳大于图像时间戳（需要插值） =====
+                    // 当IMU频率高于相机频率时，需要在图像时刻进行IMU数据插值
+                    
+                    double dt_1  = img_t - current_time; // 从当前时间到图像时间的间隔
+                    double dt_2  = t - img_t;            // 从图像时间到IMU时间的间隔
+                    current_time = img_t;                // 更新当前时间为图像时间
+                    
+                    // 时间间隔检查
                     ROS_ASSERT(dt_1 >= 0);
                     ROS_ASSERT(dt_2 >= 0);
                     ROS_ASSERT(dt_1 + dt_2 > 0);
-                    double w1 = dt_2 / (dt_1 + dt_2);
-                    double w2 = dt_1 / (dt_1 + dt_2);
-                    dx        = w1 * dx + w2 * imu_msg->linear_acceleration.x;
-                    dy        = w1 * dy + w2 * imu_msg->linear_acceleration.y;
-                    dz        = w1 * dz + w2 * imu_msg->linear_acceleration.z;
-                    rx        = w1 * rx + w2 * imu_msg->angular_velocity.x;
-                    ry        = w1 * ry + w2 * imu_msg->angular_velocity.y;
-                    rz        = w1 * rz + w2 * imu_msg->angular_velocity.z;
+                    
+                    // 线性插值权重计算
+                    double w1 = dt_2 / (dt_1 + dt_2); // 前一个IMU数据的权重
+                    double w2 = dt_1 / (dt_1 + dt_2); // 当前IMU数据的权重
+                    
+                    // 对IMU数据进行线性插值
+                    dx = w1 * dx + w2 * imu_msg->linear_acceleration.x;
+                    dy = w1 * dy + w2 * imu_msg->linear_acceleration.y;
+                    dz = w1 * dz + w2 * imu_msg->linear_acceleration.z;
+                    rx = w1 * rx + w2 * imu_msg->angular_velocity.x;
+                    ry = w1 * ry + w2 * imu_msg->angular_velocity.y;
+                    rz = w1 * rz + w2 * imu_msg->angular_velocity.z;
+                    
+                    // 使用插值后的IMU数据进行预积分
                     estimator.processIMU(dt_1, Vector3d(dx, dy, dz), Vector3d(rx, ry, rz));
-                    //printf("dimu: dt:%f a: %f %f %f w: %f %f %f\n",dt_1, dx, dy, dz, rx, ry, rz);
                 }
             }
 
-            // 2. VINS Optimization
-            // TicToc t_s;
+            // ########################################
+            // ##### 第3步：VINS视觉优化处理 #####
+            // ########################################
+            
+            // 构建特征点数据结构：map<特征点ID, vector<相机ID和8维特征向量>>
             map<int, vector<pair<int, Eigen::Matrix<double, 8, 1>>>> image;
+            
+            // 解析图像特征点消息
             for (unsigned int i = 0; i < img_msg->points.size(); i++)
             {
-                int    v          = img_msg->channels[0].values[i] + 0.5;
-                int    feature_id = v / NUM_OF_CAM;
-                int    camera_id  = v % NUM_OF_CAM;
-                double x          = img_msg->points[i].x;
-                double y          = img_msg->points[i].y;
-                double z          = img_msg->points[i].z;
-                double p_u        = img_msg->channels[1].values[i];
-                double p_v        = img_msg->channels[2].values[i];
-                double velocity_x = img_msg->channels[3].values[i];
-                double velocity_y = img_msg->channels[4].values[i];
-                double depth      = img_msg->channels[5].values[i];
+                // 解码特征点ID和相机ID
+                int    v          = img_msg->channels[0].values[i] + 0.5; // 全局特征点ID编码
+                int    feature_id = v / NUM_OF_CAM;                       // 真实特征点ID
+                int    camera_id  = v % NUM_OF_CAM;                       // 相机ID
+                
+                // 提取特征点的各种信息
+                double x          = img_msg->points[i].x;            // 归一化相机坐标x
+                double y          = img_msg->points[i].y;            // 归一化相机坐标y
+                double z          = img_msg->points[i].z;            // 归一化相机坐标z（应为1）
+                double p_u        = img_msg->channels[1].values[i];  // 像素坐标u
+                double p_v        = img_msg->channels[2].values[i];  // 像素坐标v
+                double velocity_x = img_msg->channels[3].values[i];  // 光流速度x分量
+                double velocity_y = img_msg->channels[4].values[i];  // 光流速度y分量
+                double depth      = img_msg->channels[5].values[i];  // 激光雷达深度信息
 
-                ROS_ASSERT(z == 1);
+                ROS_ASSERT(z == 1); // 确保归一化坐标z分量为1
+                
+                // 构建8维特征向量：[归一化坐标(3) + 像素坐标(2) + 光流速度(2) + 深度(1)]
                 Eigen::Matrix<double, 8, 1> xyz_uv_velocity_depth;
                 xyz_uv_velocity_depth << x, y, z, p_u, p_v, velocity_x, velocity_y, depth;
+                
+                // 将特征点数据按ID分组存储
                 image[feature_id].emplace_back(camera_id, xyz_uv_velocity_depth);
             }
 
-            // Get initialization info from lidar odometry
+            // ##### 获取激光里程计初始化信息 #####
             vector<float> initialization_info;
             m_odom.lock();
+            // 从激光里程计中获取当前图像时刻的位姿信息，用于VINS系统初始化
             initialization_info =
                 odomRegister->getOdometry(odomQueue, img_msg->header.stamp.toSec() + estimator.td);
             m_odom.unlock();
 
+            // ##### 执行VINS主要处理 #####
+            // 融合视觉特征点、IMU预积分结果和激光里程计信息，进行非线性优化
             estimator.processImage(image, initialization_info, img_msg->header);
-            // double whole_t = t_s.toc();
-            // printStatistics(estimator, whole_t);
 
-            // 3. Visualization
+            // ########################################
+            // ##### 第4步：结果发布和可视化 #####
+            // ########################################
+            
             std_msgs::Header header = img_msg->header;
-            pubOdometry(estimator, header);
-            pubKeyPoses(estimator, header);
-            pubCameraPose(estimator, header);
-            pubPointCloud(estimator, header);
-            pubTF(estimator, header);
-            pubKeyframe(estimator);
+            
+            // 发布各种估计结果和可视化信息
+            pubOdometry(estimator, header);    // 发布里程计信息（位姿、速度等）
+            pubKeyPoses(estimator, header);    // 发布关键帧位姿
+            pubCameraPose(estimator, header);  // 发布相机位姿
+            pubPointCloud(estimator, header);  // 发布三维点云地图
+            pubTF(estimator, header);          // 发布TF变换关系
+            pubKeyframe(estimator);            // 发布关键帧信息
         }
-        m_estimator.unlock();
+        
+        m_estimator.unlock(); // 解锁估计器
 
+        // ##### 第5步：状态更新 #####
         m_buf.lock();
         m_state.lock();
+        
+        // 如果估计器已经进入非线性优化状态，更新系统状态
         if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
-            update();
+            update(); // 更新全局状态变量
+            
         m_state.unlock();
         m_buf.unlock();
     }
