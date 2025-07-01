@@ -447,52 +447,150 @@ void FeatureTracker::showUndistortion(const string &name)
     cv::waitKey(0);
 }
 
+/**
+ * [功能描述]：将当前帧特征点的像素坐标转换为去畸变的归一化相机坐标，并计算特征点速度
+ * 
+ * 主要任务：
+ * 1. 像素坐标 → 归一化相机坐标变换（消除畸变影响）
+ * 2. 计算特征点在归一化坐标系下的运动速度
+ * 3. 更新ID到坐标的映射表，便于快速查找
+ * 
+ * 输出结果：
+ * - cur_un_pts: 当前帧归一化坐标
+ * - cur_un_pts_map: ID到坐标的映射
+ * - pts_velocity: 特征点速度向量
+ */
 void FeatureTracker::undistortedPoints()
 {
+    // ########################################
+    // ##### 第1步：清空和初始化数据容器 #####
+    // ########################################
+    
+    // 清空当前帧的归一化坐标容器
+    // 准备存储新计算的去畸变归一化坐标
     cur_un_pts.clear();
+    
+    // 清空当前帧的ID到坐标映射表
+    // 重新建立特征点ID与归一化坐标的对应关系
     cur_un_pts_map.clear();
-    //cv::undistortPoints(cur_pts, un_pts, K, cv::Mat());
+    
+    // 注释掉的OpenCV标准去畸变函数：
+    // cv::undistortPoints(cur_pts, un_pts, K, cv::Mat());
+    // 这里使用更通用的相机模型方法，支持多种畸变类型
+
+    // ########################################
+    // ##### 第2步：像素坐标到归一化坐标变换 #####
+    // ########################################
+    
+    // 遍历当前帧所有特征点，进行坐标变换
     for (unsigned int i = 0; i < cur_pts.size(); i++)
     {
+        // ===== 提取当前特征点的像素坐标 =====
+        // 将cv::Point2f格式转换为Eigen::Vector2d格式
         Eigen::Vector2d a(cur_pts[i].x, cur_pts[i].y);
-        Eigen::Vector3d b;
+        
+        // ===== 执行去畸变和归一化变换 =====
+        Eigen::Vector3d b; // 3D射线向量（在相机坐标系中）
+        
+        // 使用相机模型的liftProjective函数：
+        // 功能：像素坐标 → 3D射线方向（考虑畸变校正）
+        // 输入：像素坐标 a(u,v)
+        // 输出：对应的3D射线向量 b(X,Y,Z)
+        // 该函数内部处理了：
+        // 1. 去除相机内参影响
+        // 2. 畸变校正（针孔、鱼眼等多种模型）
+        // 3. 转换为单位球面上的射线方向
         m_camera->liftProjective(a, b);
-        cur_un_pts.push_back(cv::Point2f(b.x() / b.z(), b.y() / b.z()));
-        cur_un_pts_map.insert(make_pair(ids[i], cv::Point2f(b.x() / b.z(), b.y() / b.z())));
-        //printf("cur pts id %d %f %f", ids[i], cur_un_pts[i].x, cur_un_pts[i].y);
+        
+        // ===== 归一化到z=1平面 =====
+        // 将3D射线投影到z=1的归一化平面上
+        // 公式：(X/Z, Y/Z, 1) → (X/Z, Y/Z)
+        // 这是标准的归一化相机坐标，消除了焦距的影响
+        cv::Point2f normalized_point(b.x() / b.z(), b.y() / b.z());
+        
+        // 添加到归一化坐标容器中
+        cur_un_pts.push_back(normalized_point);
+        
+        // ===== 建立ID到坐标的映射关系 =====
+        // 将特征点ID与其归一化坐标关联
+        // 便于后续基于ID的快速坐标查找
+        cur_un_pts_map.insert(make_pair(ids[i], normalized_point));
+        
+        // 调试输出（已注释）：
+        // printf("cur pts id %d %f %f", ids[i], cur_un_pts[i].x, cur_un_pts[i].y);
     }
-    // caculate points velocity
+
+    // ########################################
+    // ##### 第3步：计算特征点运动速度 #####
+    // ########################################
+    
+    // 检查是否存在前一帧的归一化坐标数据
     if (!prev_un_pts_map.empty())
     {
+        // ===== 计算时间间隔 =====
+        // 当前帧与前一帧之间的时间差（秒）
         double dt = cur_time - prev_time;
+        
+        // 清空速度容器，准备计算新的速度
         pts_velocity.clear();
+        
+        // ===== 为每个特征点计算速度 =====
         for (unsigned int i = 0; i < cur_un_pts.size(); i++)
         {
+            // 检查特征点是否有有效ID（-1表示新特征点，暂无ID）
             if (ids[i] != -1)
             {
+                // 在前一帧映射表中查找相同ID的特征点
                 std::map<int, cv::Point2f>::iterator it;
                 it = prev_un_pts_map.find(ids[i]);
+                
                 if (it != prev_un_pts_map.end())
                 {
-                    double v_x = (cur_un_pts[i].x - it->second.x) / dt;
-                    double v_y = (cur_un_pts[i].y - it->second.y) / dt;
+                    // ===== 找到匹配的前一帧位置，计算速度 =====
+                    // 速度公式：v = (当前位置 - 前一位置) / 时间间隔
+                    // 在归一化相机坐标系中计算，单位为 坐标单位/秒
+                    double v_x = (cur_un_pts[i].x - it->second.x) / dt; // x方向速度
+                    double v_y = (cur_un_pts[i].y - it->second.y) / dt; // y方向速度
+                    
+                    // 添加计算得到的速度向量
                     pts_velocity.push_back(cv::Point2f(v_x, v_y));
                 }
                 else
+                {
+                    // ===== 前一帧中没有找到对应特征点 =====
+                    // 可能原因：特征点是新出现的，或者前一帧跟踪失败
+                    // 设置速度为零
                     pts_velocity.push_back(cv::Point2f(0, 0));
+                }
             }
             else
             {
+                // ===== 特征点ID无效（新检测的特征点） =====
+                // 新特征点没有历史轨迹，无法计算速度
+                // 设置速度为零
                 pts_velocity.push_back(cv::Point2f(0, 0));
             }
         }
     }
     else
     {
+        // ########################################
+        // ##### 第4步：处理首帧情况 #####
+        // ########################################
+        
+        // 如果前一帧映射表为空（说明是第一帧或重新初始化）
+        // 所有特征点的速度都设为零
         for (unsigned int i = 0; i < cur_pts.size(); i++)
         {
             pts_velocity.push_back(cv::Point2f(0, 0));
         }
     }
+    
+    // ########################################
+    // ##### 第5步：更新历史数据 #####
+    // ########################################
+    
+    // 将当前帧的映射表保存为前一帧映射表
+    // 为下一次速度计算做准备
     prev_un_pts_map = cur_un_pts_map;
 }
