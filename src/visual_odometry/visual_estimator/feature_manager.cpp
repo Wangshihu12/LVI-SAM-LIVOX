@@ -861,77 +861,250 @@ void FeatureManager::removeBackShiftDepth(Eigen::Matrix3d marg_R, Eigen::Vector3
     }
 }
 
+/**
+ * [功能描述]：处理滑动窗口边缘化最旧帧后的特征点管理
+ * 
+ * 调用时机：当边缘化策略为MARGIN_OLD时，在窗口滑动后进行特征点清理
+ * 
+ * 主要任务：
+ * 1. 更新所有特征点的起始帧索引（整体前移一位）
+ * 2. 处理从最旧帧开始的特征点（删除其第一帧观测）
+ * 3. 清理观测不足的无效特征点
+ * 
+ * 窗口滑动原理：
+ * 原始帧序列: [0, 1, 2, ..., WINDOW_SIZE]
+ * 滑动后序列: [1, 2, 3, ..., WINDOW_SIZE, new]
+ * 索引映射:   [0, 1, 2, ..., WINDOW_SIZE-1]
+ */
 void FeatureManager::removeBack()
 {
+    // ########################################
+    // ##### 安全遍历所有特征点 #####
+    // ########################################
+    
+    // 使用双迭代器模式避免删除时的迭代器失效问题
+    // it: 当前处理的特征点迭代器
+    // it_next: 下一个特征点迭代器（预先保存，防止删除时失效）
     for (auto it = feature.begin(), it_next = feature.begin();
          it != feature.end(); it = it_next)
     {
+        // ===== 预先递增下一个迭代器 =====
+        // 在可能删除当前元素之前，先保存下一个有效位置
         it_next++;
 
+        // ########################################
+        // ##### 情况1：特征点不从最旧帧开始 #####
+        // ########################################
+        
+        // 如果特征点的起始帧不是第0帧（最旧帧）
+        // 说明该特征点从第1帧或更晚的帧开始被观测
         if (it->start_frame != 0)
-            it->start_frame--;
-        else
         {
+            // 将起始帧索引减1，适应窗口滑动后的新索引
+            // 例如：原来从第2帧开始 → 现在从第1帧开始
+            it->start_frame--;
+        }
+        
+        // ########################################
+        // ##### 情况2：特征点从最旧帧开始 #####
+        // ########################################
+        
+        else  // it->start_frame == 0
+        {
+            // ===== 第1步：删除第一帧观测 =====
+            // 删除该特征点在最旧帧（第0帧）的观测记录
+            // 因为最旧帧已被边缘化，不再参与优化
             it->feature_per_frame.erase(it->feature_per_frame.begin());
+            
+            // ===== 第2步：检查剩余观测数量 =====
+            // 如果删除第一帧观测后，该特征点没有任何观测了
+            // 说明该特征点只在被边缘化的帧中被观测到
             if (it->feature_per_frame.size() == 0)
+            {
+                // 完全删除该特征点，因为它已无法提供有效信息
                 feature.erase(it);
+            }
+            // 注意：如果还有其他帧的观测，start_frame保持为0
+            // 因为删除第一帧后，原第1帧的观测现在位于索引0位置
         }
     }
 }
 
+/**
+ * [功能描述]：处理滑动窗口边缘化第二新帧时的特征点管理
+ * 
+ * @param frame_count：被边缘化的帧索引（通常是倒数第二帧，即WINDOW_SIZE-1）
+ * 
+ * 调用时机：当边缘化策略为MARGIN_SECOND_NEW时，需要移除特定帧的观测数据
+ * 
+ * 主要任务：
+ * 1. 处理从被边缘化帧开始的特征点（调整起始帧索引）
+ * 2. 删除其他特征点在被边缘化帧的观测记录
+ * 3. 清理观测不足的无效特征点
+ * 
+ * 边缘化策略说明：
+ * MARGIN_SECOND_NEW通常在相机运动较慢、视差不足时使用
+ * 保留最新帧和历史帧，删除中间某帧以维持观测质量
+ */
 void FeatureManager::removeFront(int frame_count)
 {
-    for (auto it = feature.begin(), it_next = feature.begin(); it != feature.end(); it = it_next)
+    // ########################################
+    // ##### 安全遍历所有特征点 #####
+    // ########################################
+    
+    // 使用双迭代器模式避免删除时的迭代器失效问题
+    for (auto it = feature.begin(), it_next = feature.begin(); 
+         it != feature.end(); it = it_next)
     {
+        // 预先递增下一个迭代器，防止删除操作导致迭代器失效
         it_next++;
 
+        // ########################################
+        // ##### 情况1：特征点从被边缘化帧开始 #####
+        // ########################################
+        
+        // 如果特征点恰好从被边缘化的帧开始观测
         if (it->start_frame == frame_count)
         {
+            // 将起始帧索引前移一位
+            // 因为原来的起始帧被删除，现在从下一帧开始
+            // 例如：原来从第8帧开始 → 现在从第7帧开始编号
             it->start_frame--;
         }
+        
+        // ########################################
+        // ##### 情况2：特征点跨越被边缘化帧 #####
+        // ########################################
+        
         else
         {
+            // ===== 第1步：计算被删除观测在数组中的索引 =====
+            // feature_per_frame数组存储结构：
+            // - 索引0对应start_frame帧的观测
+            // - 索引i对应(start_frame + i)帧的观测  
+            // - 要删除frame_count帧的观测，索引为(frame_count - start_frame)
+            // 
+            // 但这里使用了不同的计算方式：j = WINDOW_SIZE - 1 - start_frame
+            // 这是因为在边缘化处理中，数组索引可能需要特殊映射
             int j = WINDOW_SIZE - 1 - it->start_frame;
+            
+            // ===== 第2步：检查特征点是否延续到被边缘化帧 =====
+            // endFrame()返回特征点最后被观测的帧索引
+            // 如果特征点在被边缘化帧之前就结束了，无需处理
             if (it->endFrame() < frame_count - 1)
                 continue;
+            
+            // ===== 第3步：删除指定帧的观测记录 =====
+            // 从feature_per_frame数组中删除对应位置的观测数据
+            // 这样就移除了该特征点在被边缘化帧中的观测信息
             it->feature_per_frame.erase(it->feature_per_frame.begin() + j);
+            
+            // ===== 第4步：清理空特征点 =====
+            // 如果删除观测后该特征点没有任何剩余观测
+            // 说明该特征点已无法提供有效约束，需要完全移除
             if (it->feature_per_frame.size() == 0)
                 feature.erase(it);
         }
     }
 }
 
+/**
+ * [功能描述]：计算特征点在相邻两帧间的补偿视差，用于关键帧选择判断
+ * 
+ * @param it_per_id：待计算的特征点对象
+ * @param frame_count：当前帧总数（滑动窗口中的帧数）
+ * @return：补偿后的视差值（像素单位）
+ * 
+ * 算法目的：
+ * - 判断倒数第二帧是否应该作为关键帧
+ * - 通过计算倒数第二帧和倒数第三帧间的视差来评估运动幅度
+ * - 视差越大说明相机运动越明显，越适合作为关键帧
+ */
 double FeatureManager::compensatedParallax2(const FeaturePerId &it_per_id, int frame_count)
 {
-    //check the second last frame is keyframe or not
-    //parallax betwwen seconde last frame and third last frame
+    // ########################################
+    // ##### 第1步：获取相邻两帧的特征点观测 #####
+    // ########################################
+    
+    // 检查倒数第二帧是否为关键帧
+    // 计算倒数第二帧和倒数第三帧之间的视差
+    
+    // 获取倒数第三帧（frame_i）的特征点观测
+    // frame_count-2: 倒数第三帧在滑动窗口中的绝对索引
+    // 减去start_frame得到在feature_per_frame数组中的相对索引
     const FeaturePerFrame &frame_i = it_per_id.feature_per_frame[frame_count - 2 - it_per_id.start_frame];
+    
+    // 获取倒数第二帧（frame_j）的特征点观测  
+    // frame_count-1: 倒数第二帧在滑动窗口中的绝对索引
     const FeaturePerFrame &frame_j = it_per_id.feature_per_frame[frame_count - 1 - it_per_id.start_frame];
 
-    double ans = 0;
+    // ########################################
+    // ##### 第2步：提取特征点坐标 #####
+    // ########################################
+    
+    double ans = 0;  // 最终返回的视差值
+    
+    // 获取倒数第二帧的归一化相机坐标
+    // point格式：[x/z, y/z, 1.0] (归一化坐标)
     Vector3d p_j = frame_j.point;
+    double u_j = p_j(0);  // 倒数第二帧的归一化x坐标
+    double v_j = p_j(1);  // 倒数第二帧的归一化y坐标
 
-    double u_j = p_j(0);
-    double v_j = p_j(1);
-
+    // 获取倒数第三帧的归一化相机坐标
     Vector3d p_i = frame_i.point;
-    Vector3d p_i_comp;
+    Vector3d p_i_comp;  // 用于存储补偿后的坐标
 
-    //int r_i = frame_count - 2;
-    //int r_j = frame_count - 1;
-    //p_i_comp = ric[camera_id_j].transpose() * Rs[r_j].transpose() * Rs[r_i] * ric[camera_id_i] * p_i;
+    // ########################################
+    // ##### 第3步：旋转补偿计算（当前被简化） #####
+    // ########################################
+    
+    // 注释掉的代码是完整的旋转补偿算法：
+    // int r_i = frame_count - 2;  // 倒数第三帧索引
+    // int r_j = frame_count - 1;  // 倒数第二帧索引
+    // 
+    // 完整补偿公式：将frame_i的特征点变换到frame_j的坐标系
+    // p_i_comp = ric[camera_id_j].transpose() * Rs[r_j].transpose() * Rs[r_i] * ric[camera_id_i] * p_i;
+    // 
+    // 变换链：frame_i相机坐标 → frame_i IMU坐标 → 世界坐标 → frame_j IMU坐标 → frame_j相机坐标
+    
+    // 当前简化版本：直接使用原始坐标（假设相机间旋转很小）
     p_i_comp = p_i;
-    double dep_i = p_i(2);
-    double u_i = p_i(0) / dep_i;
-    double v_i = p_i(1) / dep_i;
-    double du = u_i - u_j, dv = v_i - v_j;
 
-    double dep_i_comp = p_i_comp(2);
-    double u_i_comp = p_i_comp(0) / dep_i_comp;
-    double v_i_comp = p_i_comp(1) / dep_i_comp;
-    double du_comp = u_i_comp - u_j, dv_comp = v_i_comp - v_j;
+    // ########################################
+    // ##### 第4步：计算原始视差 #####
+    // ########################################
+    
+    // 将倒数第三帧的归一化坐标转换为像素坐标形式
+    double dep_i = p_i(2);           // 深度分量（通常为1.0）
+    double u_i = p_i(0) / dep_i;     // 归一化x坐标
+    double v_i = p_i(1) / dep_i;     // 归一化y坐标
+    
+    // 计算两帧间的坐标差值（原始视差）
+    double du = u_i - u_j;  // x方向位移
+    double dv = v_i - v_j;  // y方向位移
 
+    // ########################################
+    // ##### 第5步：计算补偿后视差 #####
+    // ########################################
+    
+    // 对补偿后的坐标进行同样处理
+    double dep_i_comp = p_i_comp(2);                    // 补偿后深度
+    double u_i_comp = p_i_comp(0) / dep_i_comp;        // 补偿后x坐标  
+    double v_i_comp = p_i_comp(1) / dep_i_comp;        // 补偿后y坐标
+    
+    // 计算补偿后的坐标差值
+    double du_comp = u_i_comp - u_j;  // 补偿后x方向位移
+    double dv_comp = v_i_comp - v_j;  // 补偿后y方向位移
+
+    // ########################################
+    // ##### 第6步：选择最小视差值 #####
+    // ########################################
+    
+    // 计算两种视差的欧几里得距离，取较小值
+    // 这样可以避免因补偿不准确而高估视差
+    // sqrt(du*du + dv*dv): 原始视差距离
+    // sqrt(du_comp*du_comp + dv_comp*dv_comp): 补偿后视差距离
     ans = max(ans, sqrt(min(du * du + dv * dv, du_comp * du_comp + dv_comp * dv_comp)));
 
-    return ans;
+    return ans;  // 返回最终的补偿视差值
 }
